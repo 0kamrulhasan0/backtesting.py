@@ -21,16 +21,7 @@ Backtest trading strategies with Python.
 Installation
 ------------
 
-    $ pip install backtesting
-
-For Dhaka Stock Exchange (DSE) support with dividend-adjusted data:
-
-    $ pip install 'backtesting[dse]'
-
-Or if you prefer the bleeding edge:
-
-    $ pip install git+https://github.com/kernc/backtesting.py
-
+    $ pip install git+https://github.com/0kamrulhasan0/backtesting.py
 
 Usage
 -----
@@ -38,7 +29,9 @@ Usage
 from backtesting import Backtest, Strategy
 from backtesting.lib import crossover
 
-from backtesting.test import SMA, GOOG
+def SMA(values, n):
+    import pandas as pd
+    return pd.Series(values).rolling(n).mean().values
 
 
 class SmaCross(Strategy):
@@ -51,10 +44,12 @@ class SmaCross(Strategy):
         if crossover(self.ma1, self.ma2):
             self.buy()
         elif crossover(self.ma2, self.ma1):
-            self.sell()
+            self.position.close()
 
 
-bt = Backtest(GOOG, SmaCross, commission=.002,
+# For DSE (Dhaka Stock Exchange) use ConstrainedBacktest:
+# bt = ConstrainedBacktest(data, SmaCross, cash=1_000_000, lot_size=1)
+bt = Backtest(SQURPHARMA, SmaCross, commission=.0005,
               exclusive_orders=True)
 stats = bt.run()
 bt.plot()
@@ -134,7 +129,12 @@ Backtesting.py includes `ConstrainedBacktest` for regulated markets like Banglad
 ```python
 import dsebd
 from backtesting import ConstrainedBacktest, Strategy
-from backtesting.lib import crossover, SMA
+from backtesting.lib import crossover
+
+def SMA(values, n):
+    import pandas as pd
+    return pd.Series(values).rolling(n).mean().values
+
 
 # Update local cache
 dsebd.update()
@@ -160,7 +160,7 @@ bt.plot()
 Or use the convenience method with any data source:
 
 ```python
-bt = ConstrainedBacktest.from_data_source('SQURPHARMA', SmaCross, 
+bt = ConstrainedBacktest.from_data_source('SQURPHARMA', SmaCross,
                                           period='5y', cash=1_000_000,
                                           data_source=dsebd)
 stats = bt.run()
