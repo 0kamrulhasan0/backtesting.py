@@ -55,6 +55,9 @@ if __name__ == '__main__':
                 'coverage',
                 'mypy',
             ],
+            'dse': [
+                'dsebd @ git+https://github.com/0kamrulhasan0/dsebd.git',
+            ],
         },
         test_suite="backtesting.test",
         python_requires='>=3.9',

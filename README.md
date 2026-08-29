@@ -23,6 +23,10 @@ Installation
 
     $ pip install backtesting
 
+For Dhaka Stock Exchange (DSE) support with dividend-adjusted data:
+
+    $ pip install 'backtesting[dse]'
+
 Or if you prefer the bleeding edge:
 
     $ pip install git+https://github.com/kernc/backtesting.py
@@ -116,6 +120,57 @@ Features
 
 ![xkcd.com/1570](https://imgs.xkcd.com/comics/engineer_syllogism.png)
 
+
+Dhaka Stock Exchange (DSE) Support
+----------------------------------
+Backtesting.py includes `ConstrainedBacktest` for regulated markets like Bangladesh (DSE):
+- Long-only trading (no short selling)
+- Lot size enforcement (e.g., 1, 10, 100 shares)
+- Circuit breakers (±10% daily price limits)
+- T+2 settlement delay
+- Dividend-adjusted prices (critical for bonus shares like 200% stock dividends)
+- Default commission: 0.05% per trade
+
+```python
+import dsebd
+from backtesting import ConstrainedBacktest, Strategy
+from backtesting.lib import crossover, SMA
+
+# Update local cache
+dsebd.update()
+
+# Download dividend-adjusted data (critical for DSE bonus shares)
+data = dsebd.download('SQURPHARMA', period='5y', adjusted=True)
+
+class SmaCross(Strategy):
+    def init(self):
+        self.ma1 = self.I(SMA, self.data.Close, 10)
+        self.ma2 = self.I(SMA, self.data.Close, 20)
+    def next(self):
+        if crossover(self.ma1, self.ma2):
+            self.buy()                    # Enter long
+        elif crossover(self.ma2, self.ma1):
+            self.position.close()         # Exit long (NOT self.sell())
+
+bt = ConstrainedBacktest(data, SmaCross, cash=1_000_000, lot_size=1)
+stats = bt.run()
+bt.plot()
+```
+
+Or use the convenience method with any data source:
+
+```python
+bt = ConstrainedBacktest.from_data_source('SQURPHARMA', SmaCross, 
+                                          period='5y', cash=1_000_000,
+                                          data_source=dsebd)
+stats = bt.run()
+```
+
+**Key differences from standard Backtest:**
+- `Strategy.sell()` raises `NotImplementedError` (use `position.close()`)
+- Orders rounded to nearest lot size
+- Market orders clipped to ±10% circuit breaker
+- Cash from trades unavailable for 2 days (T+2)
 
 Bugs
 ----

@@ -266,6 +266,15 @@ class Strategy(metaclass=ABCMeta):
             If you merely want to close an existing long position,
             use `Position.close()` or `Trade.close()`.
         """
+        # Check if this is a constrained backtest (e.g., DSE prohibits short selling)
+        if getattr(self._broker, '_price_limit_pct', 0) > 0 or \
+           getattr(self._broker, '_settlement_days', 0) > 0 or \
+           getattr(self._broker, '_lot_size', 1) > 1:
+            raise NotImplementedError(
+                "Short selling is prohibited on this exchange. "
+                "To exit a long position, use: self.position.close() or trade.close(). "
+                "Use ConstrainedBacktest for markets with long-only constraints."
+            )
         assert 0 < size < 1 or round(size) == size >= 1, \
             "size must be a positive fraction of equity, or a positive whole number of units"
         return self._broker.new_order(-size, limit, stop, sl, tp, tag)
@@ -725,9 +734,15 @@ class Trade:
 
 class _Broker:
     def __init__(self, *, data, cash, spread, commission, margin,
-                 trade_on_close, hedging, exclusive_orders, index):
+                 trade_on_close, hedging, exclusive_orders, index,
+                 lot_size: int = 1,
+                 price_limit_pct: float = 0.0,
+                 settlement_days: int = 0):
         assert cash > 0, f"cash should be > 0, is {cash}"
         assert 0 < margin <= 1, f"margin should be between 0 and 1, is {margin}"
+        assert lot_size >= 1, f"lot_size must be >= 1, is {lot_size}"
+        assert 0 <= price_limit_pct < 1, f"price_limit_pct must be in [0, 1), is {price_limit_pct}"
+        assert settlement_days >= 0, f"settlement_days must be >= 0, is {settlement_days}"
         self._data: _Data = data
         self._cash = cash
 
@@ -749,6 +764,10 @@ class _Broker:
         self._trade_on_close = trade_on_close
         self._hedging = hedging
         self._exclusive_orders = exclusive_orders
+        self._lot_size = lot_size
+        self._price_limit_pct = price_limit_pct
+        self._settlement_days = settlement_days
+        self._unsettled_cash: List[Tuple[int, float]] = []  # (bar_index, amount)
 
         self._equity = np.tile(np.nan, len(index))
         self.orders: List[Order] = []
@@ -850,13 +869,44 @@ class _Broker:
     def margin_available(self) -> float:
         # From https://github.com/QuantConnect/Lean/pull/3768
         margin_used = sum(trade.value / self._leverage for trade in self.trades)
-        return max(0, self.equity - margin_used)
+        available = max(0, self.equity - margin_used)
+        # Subtract unsettled cash (T+2 settlement)
+        for bar_idx, amount in self._unsettled_cash:
+            if bar_idx <= self._i:
+                available -= amount
+        return max(0, available)
+
+    @property
+    def lot_size(self) -> int:
+        return self._lot_size
+
+    @property
+    def price_limit_pct(self) -> float:
+        return self._price_limit_pct
+
+    @property
+    def settlement_days(self) -> int:
+        return self._settlement_days
 
     def next(self):
         # Reset cached value here due to price change on every bar
         self.__dict__.pop(self.__class__._position_unrealized_pl.func.__name__, None)
 
         i = self._i = len(self._data) - 1
+
+        # Release unsettled cash after settlement period (T+2)
+        if self._settlement_days > 0:
+            released = 0
+            remaining = []
+            for bar_idx, amount in self._unsettled_cash:
+                if i - bar_idx >= self._settlement_days:
+                    released += amount
+                else:
+                    remaining.append((bar_idx, amount))
+            if released:
+                self._cash += released
+                self._unsettled_cash = remaining
+
         self._process_orders()
 
         # Log account equity for the equity curve
@@ -927,6 +977,32 @@ class _Broker:
                 if is_market_order and self._trade_on_close and not order.is_contingent else
                 self._i)
 
+            # DSE: Apply circuit breaker price limits (±price_limit_pct from prev close)
+            if self._price_limit_pct > 0 and not order.is_contingent:
+                prev_close = data.Close[-2] if len(data.Close) > 1 else open
+                limit_up = prev_close * (1 + self._price_limit_pct)
+                limit_down = prev_close * (1 - self._price_limit_pct)
+
+                if order.is_long:
+                    # For limit orders: reject if limit price outside circuit breaker
+                    if order.limit is not None and order.limit > limit_up:
+                        warnings.warn(
+                            f'Limit price {order.limit:.2f} exceeds circuit breaker limit_up {limit_up:.2f}. Order rejected.',
+                            category=UserWarning)
+                        self.orders.remove(order)
+                        continue
+                    # For market/stop orders: clip execution price
+                    price = min(max(price, limit_down), limit_up)
+                else:
+                    # Short orders (shouldn't happen with DSE, but handle anyway)
+                    if order.limit is not None and order.limit < limit_down:
+                        warnings.warn(
+                            f'Limit price {order.limit:.2f} below circuit breaker limit_down {limit_down:.2f}. Order rejected.',
+                            category=UserWarning)
+                        self.orders.remove(order)
+                        continue
+                    price = min(max(price, limit_down), limit_up)
+
             # If order is a SL/TP order, it should close an existing trade it was contingent upon
             if order.parent_trade:
                 trade = order.parent_trade
@@ -977,6 +1053,12 @@ class _Broker:
                     # XXX: The order is canceled by the broker?
                     self.orders.remove(order)
                     continue
+
+            # DSE: Round size to lot size (round UP to nearest lot)
+            if self._lot_size > 1:
+                lots = (abs(size) + self._lot_size - 1) // self._lot_size
+                size = copysign(max(self._lot_size, lots * self._lot_size), size)
+
             assert size == round(size)
             need_size = int(size)
 
@@ -1087,7 +1169,12 @@ class _Broker:
         self.closed_trades.append(closed_trade)
         # Apply commission one more time at trade exit
         commission = self._commission(trade.size, price)
-        self._cash += trade.pl - commission
+        cash_from_trade = trade.pl - commission
+        # DSE: Track unsettled cash for T+2 settlement
+        if self._settlement_days > 0:
+            self._unsettled_cash.append((self._i, cash_from_trade))
+        else:
+            self._cash += cash_from_trade
         # Save commissions on Trade instance for stats
         trade_open_commission = self._commission(closed_trade.size, closed_trade.entry_price)
         # applied here instead of on Trade open because size could have changed
@@ -1765,6 +1852,138 @@ class Backtest:
             reverse_indicators=reverse_indicators,
             show_legend=show_legend,
             open_browser=open_browser)
+
+
+class ConstrainedBacktest(Backtest):
+    """
+    Backtest for regulated exchanges with market constraints:
+    - Long-only (no short selling)
+    - Lot size rounding
+    - Circuit breakers (daily price limits)
+    - Settlement delay (T+N)
+    - Configurable commission
+
+    Example (Dhaka Stock Exchange):
+        import dsebd
+        from backtesting import ConstrainedBacktest, Strategy
+        from backtesting.lib import crossover, SMA
+
+        dsebd.update()
+        data = dsebd.download('SQURPHARMA', period='5y', adjusted=True)
+
+        class SmaCross(Strategy):
+            def init(self):
+                self.ma1 = self.I(SMA, self.data.Close, 10)
+                self.ma2 = self.I(SMA, self.data.Close, 20)
+            def next(self):
+                if crossover(self.ma1, self.ma2):
+                    self.buy()
+                elif crossover(self.ma2, self.ma1):
+                    self.position.close()
+
+        bt = ConstrainedBacktest(data, SmaCross, cash=1_000_000, lot_size=1)
+        stats = bt.run()
+        bt.plot()
+    """
+
+    def __init__(self,
+                 data: pd.DataFrame,
+                 strategy: Type[Strategy],
+                 *,
+                 cash: float = 1_000_000,
+                 commission: Union[float, Tuple[float, float]] = (0, 0.0005),
+                 lot_size: int = 1,
+                 price_limit_pct: float = 0.10,
+                 settlement_days: int = 2,
+                 spread: float = 0.0,
+                 margin: float = 1.0,
+                 trade_on_close: bool = False,
+                 hedging: bool = False,
+                 exclusive_orders: bool = True,
+                 finalize_trades: bool = False):
+        # Force constrained exchange constraints
+        super().__init__(
+            data=data,
+            strategy=strategy,
+            cash=cash,
+            spread=spread,
+            commission=commission,
+            margin=margin,
+            trade_on_close=trade_on_close,
+            hedging=hedging,
+            exclusive_orders=exclusive_orders,
+            finalize_trades=finalize_trades,
+        )
+        # Override broker with constraint params
+        self._broker = partial(
+            _Broker,
+            cash=cash,
+            spread=spread,
+            commission=commission,
+            margin=margin,
+            trade_on_close=trade_on_close,
+            hedging=hedging,
+            exclusive_orders=exclusive_orders,
+            index=data.index,
+            lot_size=lot_size,
+            price_limit_pct=price_limit_pct,
+            settlement_days=settlement_days,
+        )
+        self._lot_size = lot_size
+        self._price_limit_pct = price_limit_pct
+        self._settlement_days = settlement_days
+
+    @classmethod
+    def from_data_source(cls, ticker: str, strategy: Type[Strategy], *,
+                         period: str = '5y',
+                         cash: float = 1_000_000,
+                         commission: Union[float, Tuple[float, float]] = (0, 0.0005),
+                         lot_size: int = 1,
+                         price_limit_pct: float = 0.10,
+                         settlement_days: int = 2,
+                         data_source=None,
+                         **kwargs):
+        """
+        Create ConstrainedBacktest directly from data source.
+
+        Args:
+            ticker: Symbol to download (e.g., 'SQURPHARMA' for DSE)
+            strategy: Strategy class to test
+            period: Data period ('1d', '5d', '1mo', '3mo', '6mo', '1y', '5y', etc.)
+            cash: Initial cash in base currency
+            commission: Commission tuple (fixed, relative)
+            lot_size: Lot size for the ticker
+            price_limit_pct: Circuit breaker percentage (default 10%)
+            settlement_days: Settlement period (default 2 for T+2)
+            data_source: Module with `update()` and `download(ticker, period, adjusted=True)` methods
+            **kwargs: Additional arguments passed to ConstrainedBacktest
+
+        Returns:
+            ConstrainedBacktest instance ready to run
+        """
+        if data_source is None:
+            try:
+                import dsebd as data_source
+            except ImportError:
+                raise ImportError(
+                    "Data source module required. For DSE: pip install git+https://github.com/0kamrulhasan0/dsebd.git"
+                ) from None
+
+        data_source.update()
+        data = data_source.download(ticker, period=period, adjusted=True)
+        if data.empty:
+            raise ValueError(f"No data found for ticker {ticker}")
+
+        return cls(
+            data=data,
+            strategy=strategy,
+            cash=cash,
+            commission=commission,
+            lot_size=lot_size,
+            price_limit_pct=price_limit_pct,
+            settlement_days=settlement_days,
+            **kwargs
+        )
 
 
 # NOTE: Don't put anything public below this __all__ list

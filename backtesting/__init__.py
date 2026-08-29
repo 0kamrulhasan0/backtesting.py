@@ -68,7 +68,7 @@ except ImportError:
 from . import lib  # noqa: F401
 from ._plotting import set_bokeh_output  # noqa: F401
 from ._util import try_
-from .backtesting import Backtest, Strategy  # noqa: F401
+from .backtesting import Backtest, Strategy, ConstrainedBacktest  # noqa: F401
 
 # Skip Pool in pdoc3 API docs. Interested users get the warning.
 __pdoc__ = {'backtesting.Pool': False}
