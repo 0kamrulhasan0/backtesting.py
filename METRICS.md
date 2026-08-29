@@ -267,8 +267,38 @@ max_dd = -np.nan_to_num(dd.max())
 s['Max. Drawdown [%]'] = max_dd * 100
 ```
 
+**Step-by-Step Mathematical Breakdown**:
+
+1. **`np.maximum.accumulate(equity)`** — Running peak (high-water mark)
+   - Returns an array where each element is the maximum of all previous equity values up to that point
+   - `accumulate` vs `max`: `np.maximum()` is element-wise between two arrays; `accumulate()` is cumulative max along a single array (expanding window, no fixed size)
+   - Example: equity = [100, 110, 105, 108, 115] → peaks = [100, 110, 110, 110, 115]
+
+2. **`equity / peak`** — Current equity as fraction of peak
+   - 1.0 = at all-time high
+   - 0.8 = 20% below peak
+   - Example: equity=105, peak=110 → 105/110 = 0.9545
+
+3. **`1 - equity/peak`** — Drawdown fraction
+   - 0 = at peak (no drawdown)
+   - 0.2 = 20% drawdown
+   - Example: 1 - 0.9545 = 0.0455 (4.55% drawdown)
+
+4. **`np.nan_to_num(dd.max())`** — Handle edge cases
+   - Converts NaN to 0 (happens if equity starts at 0 or is all zeros)
+   - `max()` finds the worst drawdown across entire period
+
+5. **`-max_dd * 100`** — Convert to positive percentage
+   - Drawdown is negative by convention; we report as positive %
+
 **Formula**: 
 $$\text{Max DD \%} = \max\left(\frac{\text{Peak Equity} - \text{Current Equity}}{\text{Peak Equity}}\right) \times 100$$
+
+**Why `accumulate`?**
+- `np.maximum()` = element-wise max between **two arrays**
+- Rolling max = fixed **window** (looks back N periods only)
+- **`accumulate()` = expanding window**, full history (no window limit)
+- Drawdown needs **all-time high to date**, not a 20-day high
 
 **Bangladeshi Example**:
 - Equity peaked at ৳16,00,000 (March 2023)
@@ -333,9 +363,35 @@ s['Volatility (Ann.) [%]'] = np.sqrt(
 ) * 100
 ```
 
+**Mathematical Breakdown** (compounding-aware formula):
+
+The standard `std × √N` assumes simple returns. For log/compound returns:
+
+1. **`day_returns.var(ddof=1)`** — Sample variance of daily returns
+   - `ddof=1` = Bessel's correction (unbiased estimator)
+
+2. **`(1 + gmean_day_return)^2`** — Squared growth factor
+   - `gmean_day_return` = geometric mean of daily returns
+   - Accounts for compounding effect on variance
+
+3. **`(var + (1+gmean)^2)^N - (1+gmean)^(2N)`** — Variance of compounded returns
+   - First term: expected value of squared compounded return
+   - Second term: squared expected compounded return
+   - Difference = variance of compounded annual return
+
+4. **`np.sqrt(...)`** — Standard deviation (volatility)
+   - Square root of variance gives standard deviation
+   - Multiply by 100 for percentage
+
+**Why not simple `std × √240`?**
+- Simple formula assumes returns are independent and additive
+- Compounding means returns multiply: `(1+r1)(1+r2)...`
+- This formula correctly handles the variance of the product
+
 **Bangladeshi Example**:
 - Daily return std: 1.2%
-- Annualized = 1.2% × √240 = **18.6%**
+- Simple annualized: 1.2% × √240 = **18.6%**
+- Compounding-aware (this formula): ~19.2%
 - DSE is more volatile than developed markets (15-20% typical)
 
 ### `CAGR [%]`
@@ -386,6 +442,29 @@ s['Sortino Ratio'] = (annualized_return - risk_free_rate) / (
 )
 ```
 
+**Mathematical Breakdown**:
+
+1. **`day_returns.clip(-np.inf, 0)`** — Keep only negative returns
+   - Positive returns → 0
+   - Negative returns → unchanged
+   - Example: [0.02, -0.01, 0.03, -0.015] → [0, -0.01, 0, -0.015]
+
+2. **`clip(...)**2`** — Square the negative returns
+   - [-0.01, 0, -0.015] → [0.0001, 0, 0.000225]
+
+3. **`np.mean(...)`** — Average of squared negative returns
+   - This is the **downside variance** (semi-variance)
+   - Only penalizes bad volatility, not good volatility
+
+4. **`np.sqrt(...) * np.sqrt(annual_trading_days)`** — Annualized downside deviation
+   - Square root = standard deviation
+   - × √N = annualize
+
+**Why Sortino > Sharpe for DSE?**
+- Sharpe penalizes ALL volatility (including big winning days)
+- DSE has asymmetric returns: few big winners, many small losers
+- Sortino only penalizes the downside → fairer for trend strategies
+
 **Formula**:
 $$\text{Sortino} = \frac{R_p - R_f}{\sigma_{\text{downside}}}$$
 
@@ -401,8 +480,30 @@ $$\text{Sortino} = \frac{R_p - R_f}{\sigma_{\text{downside}}}$$
 s['Calmar Ratio'] = annualized_return / (-max_dd or np.nan)
 ```
 
-**Formula**:
-$$\text{Calmar} = \frac{\text{Annual Return}}{\text{Max Drawdown}}$$
+**Mathematical Breakdown**:
+
+1. **`annualized_return`** — Compounded annual return (already computed)
+   - `(1 + gmean_day_return)^annual_trading_days - 1`
+   - Same as `Return (Ann.) [%] / 100`
+
+2. **`-max_dd`** — Max drawdown as positive decimal
+   - `max_dd` is negative (e.g., -0.25 for 25%)
+   - `-max_dd` = 0.25
+   - `or np.nan` handles case where max_dd = 0 (no drawdown)
+
+3. **Division** — How many years of return per max loss
+   - Calmar = 0.12 / 0.25 = 0.48
+   - Means: you earn 0.48 years of returns for each max drawdown risk
+
+**Interpretation**:
+- **Calmar > 1**: Annual return > max drawdown (good)
+- **Calmar = 1**: Break-even (return = max loss)
+- **Calmar < 1**: Max loss exceeds annual return (risky)
+
+**Why use Calmar?**
+- Sharpe/Sortino use volatility (statistical risk)
+- Calmar uses **realized worst-case loss** (actual risk)
+- Better for investors who fear drawdowns more than volatility
 
 **Bangladeshi Example**:
 - Annual return: 12%
@@ -417,8 +518,23 @@ beta = cov_matrix[0, 1] / cov_matrix[1, 1]
 s['Alpha [%]'] = s['Return [%]'] - rf*100 - beta * (s['Buy & Hold Return [%]'] - rf*100)
 ```
 
-**Formula**:
-$$\alpha = R_p - R_f - \beta(R_m - R_f)$$
+**Mathematical Breakdown**:
+
+1. **`np.cov(equity_log_returns, market_log_returns)`** — Covariance matrix
+   - Returns 2×2 matrix: [[var_portfolio, cov], [cov, var_market]]
+   - Uses **log returns** (continuously compounded) for CAPM accuracy
+
+2. **`beta = cov_matrix[0, 1] / cov_matrix[1, 1]`** — Covariance / Market Variance
+   - Measures how much portfolio moves with market
+   - β = 1 → moves with market; β = 1.2 → 20% more volatile
+
+3. **CAPM Expected Return**: `R_f + β(R_m - R_f)`
+   - What you SHOULD earn given your market risk
+   - Risk-free + risk premium for your beta
+
+4. **Alpha = Actual - Expected**
+   - `Return[%] - rf - β × (BuyHold[%] - rf)`
+   - Positive = skill/outperformance; Negative = underperformance
 
 **Bangladeshi Example**:
 - Strategy return: 45% (5 years) → ~7.7% annual
@@ -434,6 +550,24 @@ $$\alpha = R_p - R_f - \beta(R_m - R_f)$$
 cov_matrix = np.cov(equity_log_returns, market_log_returns)
 beta = cov_matrix[0, 1] / cov_matrix[1, 1]
 ```
+
+**Mathematical Breakdown**:
+
+1. **Log Returns**: `np.log(equity[1:] / equity[:-1])`
+   - Continuously compounded returns
+   - Additive over time (unlike simple returns)
+
+2. **Covariance Matrix** (2×2):
+   ```
+   [[var(portfolio), cov(portfolio, market)],
+    [cov(market, portfolio), var(market)]]
+   ```
+
+3. **Beta = cov / var_market**:
+   - Slope of regression line: portfolio return vs market return
+   - β = 1.0 → portfolio mirrors market
+   - β = 1.5 → portfolio amplifies market moves by 50%
+   - β = 0.0 → no correlation with market
 
 **Bangladeshi Example**:
 - Beta = 1.2 → 20% more volatile than DSEX
@@ -514,8 +648,31 @@ $$\text{Avg Trade} = \left(\prod(1 + r_i)\right)^{1/n} - 1$$
 s['Profit Factor'] = returns[returns > 0].sum() / abs(returns[returns < 0].sum())
 ```
 
-**Formula**:
-$$\text{Profit Factor} = \frac{\sum \text{Winning Returns}}{\sum |\text{Losing Returns}|}$$
+**Mathematical Breakdown**:
+
+1. **`returns[returns > 0].sum()`** — Sum of all winning trade returns
+   - Only positive returns included
+   - Example: [+10%, +5%, +15%] → sum = 30%
+
+2. **`abs(returns[returns < 0].sum())`** — Absolute sum of all losing trade returns
+   - Only negative returns, made positive
+   - Example: [-8%, -5%, -12%] → sum = 25%
+
+3. **Division** — Ratio of gross profit to gross loss
+   - PF = 30% / 25% = 1.2
+   - PF = 1.0 → break-even (wins = losses)
+   - PF > 1.0 → profitable system
+
+**Interpretation**:
+- **PF < 1.0**: Losing system
+- **PF = 1.0-1.5**: Marginal
+- **PF = 1.5-2.0**: Good
+- **PF > 2.0**: Excellent
+
+**Relationship to Win Rate**:
+- PF = (Win Rate / (1 - Win Rate)) × (Avg Win / Avg Loss)
+- Can have high Win Rate but low PF (small wins, big losses)
+- Can have low Win Rate but high PF (big wins, small losses)
 
 **Bangladeshi Example**:
 - Winning trades total return: +120%
@@ -529,8 +686,24 @@ $$\text{Profit Factor} = \frac{\sum \text{Winning Returns}}{\sum |\text{Losing R
 s['Expectancy [%]'] = returns.mean() * 100
 ```
 
-**Formula**:
-$$\text{Expectancy} = \frac{\sum r_i}{n}$$
+**Mathematical Breakdown**:
+
+1. **`returns.mean()`** — Arithmetic average of trade returns
+   - Sum of all trade returns ÷ number of trades
+   - NOT compounded (unlike Avg Trade %)
+
+2. **What it tells you**: Expected profit per trade in %
+   - Positive = profitable on average
+   - Negative = losing on average
+
+**Difference from Avg Trade [%]:**
+| Metric | Mean Type | Compounding |
+|--------|-----------|-------------|
+| Expectancy | Arithmetic | No |
+| Avg Trade % | Geometric | Yes |
+
+- Expectancy overstates if returns are volatile
+- Avg Trade % is what you'd actually get from compounding
 
 **Bangladeshi Example**:
 - 50 trades, total return 45%
@@ -543,16 +716,37 @@ $$\text{Expectancy} = \frac{\sum r_i}{n}$$
 s['SQN'] = np.sqrt(n_trades) * pl.mean() / (pl.std() or np.nan)
 ```
 
-**Formula**:
-$$\text{SQN} = \sqrt{N} \times \frac{\mu_{PnL}}{\sigma_{PnL}}$$
+**Mathematical Breakdown**:
 
-**Interpretation** (Van Tharp):
-- < 1.0: Poor
-- 1.0-1.5: Below average
-- 1.5-2.0: Average
-- 2.0-2.5: Good
-- 2.5-3.0: Excellent
-- > 3.0: Superb
+1. **`pl.mean()`** — Average P&L per trade in BDT (not %)
+   - Raw profit/loss in currency units
+   - Unlike other metrics which use %
+
+2. **`pl.std()`** — Standard deviation of P&L
+   - Measures consistency of trade outcomes
+   - Lower std = more consistent
+
+3. **`np.sqrt(n_trades)`** — Sample size adjustment
+   - More trades → higher SQN (statistical significance)
+   - √N accounts for law of large numbers
+
+4. **Ratio** = Signal-to-noise ratio scaled by sample size
+   - High mean, low std, many trades → high SQN
+
+**Van Tharp's Interpretation Scale**:
+| SQN | Rating | Action |
+|-----|--------|--------|
+| < 1.0 | Poor | Abandon |
+| 1.0-1.5 | Below avg | Needs work |
+| 1.5-2.0 | Average | Acceptable |
+| 2.0-2.5 | Good | Trade it |
+| 2.5-3.0 | Excellent | Scale up |
+| > 3.0 | Superb | Maximum size |
+
+**Why SQN matters for DSE**:
+- DSE has high commissions (0.05% each side = 1% round-trip)
+- Small sample (240 trading days/year) → need high SQN to be confident
+- Low commission strategies need >2.0; high frequency needs >2.5
 
 **Bangladeshi Example**:
 - 50 trades, avg P&L ৳8,000, std ৳25,000
@@ -564,9 +758,33 @@ $$\text{SQN} = \sqrt{N} \times \frac{\mu_{PnL}}{\sigma_{PnL}}$$
 s['Kelly Criterion'] = win_rate - (1 - win_rate) / (pl[pl > 0].mean() / -pl[pl < 0].mean())
 ```
 
-**Formula**:
-$$f^* = p - \frac{q}{b}$$
-Where: $p$ = win rate, $q$ = 1-p, $b$ = avg_win/avg_loss
+**Mathematical Breakdown**:
+
+1. **Variables**:
+   - `p = win_rate` (e.g., 0.64)
+   - `q = 1 - p` (loss rate, e.g., 0.36)
+   - `b = avg_win / avg_loss` (payoff ratio, e.g., 1.5)
+
+2. **Formula**: `f* = p - q/b`
+   - Fraction of bankroll to bet per trade
+   - Maximizes geometric growth rate (log utility)
+
+3. **Derivation** (simplified):
+   - Expected log growth = p·log(1+f·b) + q·log(1-f)
+   - Maximize w.r.t f → f* = p - q/b
+
+**Critical Assumptions**:
+- Known, fixed probabilities (p, b)
+- Infinite sequence of identical bets
+- No transaction costs (violated in DSE: 0.05% × 2 = 0.1%)
+- No correlation between trades
+
+**Why Half-Kelly for DSE?**:
+- Kelly assumes perfect knowledge of p and b
+- Real markets: p and b are estimated with error
+- DSE commissions (0.1% round-trip) reduce effective payoff
+- Full Kelly → 50% chance of 50% drawdown
+- Half-Kelly (f*/2) → 75% of Kelly growth, much less risk
 
 **Bangladeshi Example**:
 - Win rate: 64% (0.64)
